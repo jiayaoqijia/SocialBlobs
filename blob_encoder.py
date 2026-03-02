@@ -32,7 +32,7 @@ def _parse_sender(sender: bytes | str) -> bytes:
     return sender
 
 
-def encode_blob(messages: List[MessageTuple], signatures: List[bytes]) -> bytes:
+def encode_blob(messages: List[MessageTuple], signatures: List[bytes], compressor: "function") -> bytes:
     """Encode *messages* and their *signatures* into a single blob.
 
     Args:
@@ -49,6 +49,7 @@ def encode_blob(messages: List[MessageTuple], signatures: List[bytes]) -> bytes:
 
     bodies: List[bytes] = []
     for sender, nonce, content in messages:
+        content = compressor(content)
         sender_bytes = _parse_sender(sender)
         if not (0 <= nonce < (1 << 64)):
             raise ValueError(f"nonce {nonce} does not fit in 8 bytes")
@@ -79,7 +80,7 @@ if __name__ == "__main__":
     signers  = [Signer.generate() for _ in range(3)]
     sigs     = [s.sign(c) for s, c in zip(signers, contents)]
 
-    blob = encode_blob(list(zip(senders, nonces, contents)), sigs)
+    blob = encode_blob(list(zip(senders, nonces, contents)), sigs, lambda x: x)
     print(f"Generated blob: {len(blob)} bytes")
     with open("out.blob", "wb") as fh:
         fh.write(blob)

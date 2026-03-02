@@ -10,6 +10,7 @@
 
 MAX_MESSAGES: constant(uint256) = 64
 MAX_MSG_LEN:  constant(uint256) = 256
+MAX_MSG_WORDS: constant(uint256) = 8
 MAX_PAYLOAD:  constant(uint256) = 4096
 
 SENDER_SIZE: constant(uint256) = 20
@@ -17,11 +18,113 @@ NONCE_SIZE:  constant(uint256) = 8
 HEADER_SIZE: constant(uint256) = 28  # SENDER_SIZE + NONCE_SIZE
 SIG_SIZE:    constant(uint256) = 256
 
+IDENTITY:            constant(address) = 0x0000000000000000000000000000000000000004
+
 struct Message:
     sender:   address
     nonce:    uint64
     contents: Bytes[MAX_PAYLOAD]
 
+DICT_BYTES: Bytes[2560]
+
+# ------------------------------------------------------------
+# 2️⃣  Constructor – initialise with the dictionary blob
+# ------------------------------------------------------------
+@deploy
+def __init__(dict_bytes: Bytes[2560]):
+    self.DICT_BYTES = dict_bytes
+
+# ------------------------------------------------------------
+# 3️⃣  Helper – unpack a 5‑byte word into four 10‑bit codes
+# ------------------------------------------------------------
+@internal
+@view
+def _unpack(word: uint256) -> uint256[4]:
+    out: uint256[4] = [0, 0, 0, 0]
+    out[0] = (word >> 30) & 1023
+    out[1] = (word >> 20) & 1023
+    out[2] = (word >> 10) & 1023
+    out[3] = word & 1023
+    return out
+
+# ------------------------------------------------------------
+# 4️⃣  Decode – turn 5‑byte blocks back into the original message
+# ------------------------------------------------------------
+# (Maximum encoded length is 5000 bytes → 1000 words → 4000 decoded bytes)
+
+@internal
+@view
+def _decompress(encoded: Bytes[5000]) -> Bytes[MAX_MSG_LEN]:
+    """
+    `encoded` must be a multiple of 5 bytes.
+    Returns the decoded message.
+    """
+    assert len(encoded) % 5 == 0, "encoded data not 5 byte aligned"
+    assert len(encoded) <= 5000, "input too long"
+
+    out: bytes32[MAX_MSG_WORDS] = empty(bytes32[MAX_MSG_WORDS])
+    i: uint256 = 0
+    pos_in_out: uint256 = 0
+
+
+    for round: uint256 in range(MAX_MSG_LEN):
+        if i >= len(encoded):
+            outbytes: Bytes[MAX_MSG_LEN] = raw_call(
+                IDENTITY,
+                _abi_encode(out, ensure_tuple=False),
+                max_outsize=MAX_MSG_LEN,
+                is_static_call=True,
+            )
+            return slice(outbytes, 0, pos_in_out)
+        # turn 5 bytes into 40‑bit word
+        word: uint256 = convert(slice(encoded, i, 5), uint256)
+
+        # expand into 4 codes
+        c: uint256[4] = self._unpack(word)
+
+        offs: uint256 = 0
+        ln: uint256 = 0
+
+
+        # helper – compute offset & length for a single code
+        for code: uint256 in c:
+            # ---------- compute offset ----------
+            if code < 256:
+                offs = code * 4          # 4‑byte tokens
+                ln = 4
+            elif code < 512:
+                offs = 256 * 4 + (code - 256) * 3
+                ln   = 3
+            elif code < 768:
+                offs = 256 * 4 + 256 * 3 + (code - 512) * 2
+                ln   = 2
+            else:
+                offs = 256 * 4 + 256 * 3 + 256 * 2 + (code - 768)
+                ln   = 1
+
+            # ---------- sanity ----------
+            assert offs + ln <= 2560, "dictionary index out of bounds"
+            assert pos_in_out + ln <= MAX_MSG_LEN, "output buffer overflow"
+
+            # ---------- append ----------
+            if code > 0:
+                for k:uint256 in range(ln, bound=4):
+                    byte_to_add: uint256 = convert(convert(
+                        slice(self.DICT_BYTES, offs + k, 1),
+                    uint8), uint256)
+                    out[(pos_in_out + k) // 32] ^= (
+                        convert(byte_to_add << (248 - 8 * ((pos_in_out + k) % 32)),
+                        bytes32)
+                    )
+                pos_in_out += ln
+        i += 5
+
+    raise "Should never get here, there's a bug"
+
+@view
+@external
+def decompress(encoded: Bytes[5000]) -> Bytes[MAX_MSG_LEN]:
+    return self._decompress(encoded)
 
 @external
 @view
@@ -62,7 +165,7 @@ def decode(payload: Bytes[MAX_PAYLOAD]) -> (DynArray[Message, MAX_MESSAGES], Byt
         messages.append(Message(
             sender=convert(slice(payload, start,              SENDER_SIZE), address),
             nonce=convert( slice(payload, start + SENDER_SIZE, NONCE_SIZE), uint64),
-            contents=      slice(payload, start + HEADER_SIZE, msg_len),
+            contents=self._decompress(slice(payload, start + HEADER_SIZE, msg_len)),
         ))
 
     return messages, slice(payload, sig_start, SIG_SIZE)

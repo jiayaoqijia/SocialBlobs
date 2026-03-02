@@ -16,6 +16,7 @@ from vyper import compile_code
 
 from data_signer import Signer, aggregate_signatures
 from blob_encoder import encode_blob
+from bpe_encode import deploy_decoder, build_10bit_dict_from_corpus, encode_msg
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +76,9 @@ def registerCalldataBatch(
     return contentHash
 """
 
+token_to_code, DICT_BYTES, _, _ = build_10bit_dict_from_corpus("corpus.txt")
 core     = deploy(w3, compile_vyper(CORE_SOURCE),                        deployer)
-decoder  = deploy(w3, compile_vyper(Path("decoder.vy").read_text()),     deployer)
+decoder  = deploy_decoder(w3, deployer, DICT_BYTES)
 registry = deploy(w3, compile_vyper(Path("signature_registry.vy").read_text()), deployer)
 
 # ---------------------------------------------------------------------------
@@ -97,7 +99,7 @@ nonces: List[int] = list(range(n))
 message_tuples: List[Tuple[str, int, bytes]] = list(
     zip(signer_accounts, nonces, msg_contents)
 )
-blob = encode_blob(message_tuples, sigs)
+blob = encode_blob(message_tuples, sigs, lambda x: encode_msg(x, token_to_code))
 
 # ---------------------------------------------------------------------------
 # Register BLS keys (one per Ethereum account)
