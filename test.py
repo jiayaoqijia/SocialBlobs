@@ -2,9 +2,11 @@
 
 End-to-end integration test using an in-memory eth_tester chain.
 
-Deploys a minimal core contract, the blob decoder, and the BLS signature
-registry; signs messages with BLS keys; constructs and registers a blob;
-then verifies decoding and aggregate signature verification on-chain.
+Deploys the BAM Core contract (ERC-8180), blob decoder (IERC_BAM_Decoder),
+BLS signature registry (IERC_BAM_SignatureRegistry), and message exposer
+(IERC_BAM_Exposer); signs messages with BLS keys; constructs and registers
+a blob; then verifies decoding, aggregate signature verification, and
+message exposure on-chain.
 """
 
 from pathlib import Path
@@ -27,11 +29,11 @@ def compile_vyper(source: str) -> dict:
     return compile_code(source, output_formats=["abi", "bytecode"])
 
 
-def deploy(w3: Web3, compiled: dict, deployer: str):
+def deploy(w3: Web3, compiled: dict, deployer: str, *args):
     """Deploy a compiled contract and return the bound contract instance."""
     factory = w3.eth.contract(abi=compiled["abi"], bytecode=compiled["bytecode"])
     receipt = w3.eth.wait_for_transaction_receipt(
-        factory.constructor().transact({"from": deployer})
+        factory.constructor(*args).transact({"from": deployer})
     )
     return w3.eth.contract(address=receipt.contractAddress, abi=compiled["abi"])
 
@@ -52,32 +54,16 @@ w3.eth.default_account = deployer
 # Deploy contracts
 # ---------------------------------------------------------------------------
 
-CORE_SOURCE = """
-# @version ^0.4.3
+core     = deploy(w3, compile_vyper(Path("bam_core.vy").read_text()),            deployer)
+decoder  = deploy(w3, compile_vyper(Path("decoder.vy").read_text()),             deployer)
+registry = deploy(w3, compile_vyper(Path("signature_registry.vy").read_text()),  deployer)
+exposer  = deploy(w3, compile_vyper(Path("exposer.vy").read_text()),             deployer,
+                  core.address, registry.address)
 
-event BlobBatchRegistered:
-    versionedHash:     bytes32
-    submitter:         address
-    decoder:           address
-    signatureRegistry: address
-
-@external
-def registerCalldataBatch(
-    batchData: Bytes[4096], decoder: address, signatureRegistry: address
-) -> bytes32:
-    contentHash: bytes32 = keccak256(batchData)
-    log BlobBatchRegistered(
-        versionedHash=contentHash,
-        submitter=msg.sender,
-        decoder=decoder,
-        signatureRegistry=signatureRegistry,
-    )
-    return contentHash
-"""
-
-core     = deploy(w3, compile_vyper(CORE_SOURCE),                        deployer)
-decoder  = deploy(w3, compile_vyper(Path("decoder.vy").read_text()),     deployer)
-registry = deploy(w3, compile_vyper(Path("signature_registry.vy").read_text()), deployer)
+print(f"BAM Core:    {core.address}")
+print(f"Decoder:     {decoder.address}")
+print(f"Registry:    {registry.address}")
+print(f"Exposer:     {exposer.address}")
 
 # ---------------------------------------------------------------------------
 # BLS signing
@@ -112,19 +98,22 @@ for i, (signer, eth_acct) in enumerate(zip(signers, signer_accounts)):
 print("Key registration complete")
 
 # ---------------------------------------------------------------------------
-# Register blob on-chain and verify the event
+# Register blob on-chain via BAM Core and verify the event
 # ---------------------------------------------------------------------------
 
-ZERO_ADDR = Web3.to_checksum_address("0x" + "00" * 20)
 receipt = w3.eth.wait_for_transaction_receipt(
-    core.functions.registerCalldataBatch(blob, decoder.address, ZERO_ADDR)
+    core.functions.registerCalldataBatch(blob, decoder.address, registry.address)
         .transact({"from": deployer})
 )
 
-logs = core.events.BlobBatchRegistered().process_receipt(receipt)
-assert logs,                                         "No BlobBatchRegistered event"
+logs = core.events.CalldataBatchRegistered().process_receipt(receipt)
+assert logs,                                         "No CalldataBatchRegistered event"
 assert logs[0].args.submitter == deployer,           "Wrong submitter"
-assert logs[0].args.versionedHash == Web3.keccak(blob), "Wrong content hash"
+content_hash = logs[0].args.contentHash
+assert content_hash == Web3.keccak(blob),            "Wrong content hash"
+assert logs[0].args.decoder == decoder.address,      "Wrong decoder address"
+assert logs[0].args.signatureRegistry == registry.address, "Wrong registry address"
+print("✅ BAM Core registration passed (CalldataBatchRegistered event verified)")
 
 # ---------------------------------------------------------------------------
 # Decode the blob and verify its contents
@@ -165,7 +154,85 @@ except Exception:
 assert not wrong_result, "verifyAggregated accepted wrong messages"
 print("✅ Wrong message correctly rejected")
 
+# ---------------------------------------------------------------------------
+# Test IERC_BAM_Exposer — message exposure (ERC-8180)
+# ---------------------------------------------------------------------------
+
+# Register the batch in the exposer so messages can be exposed.
+exposer.functions.registerBatch(content_hash).transact({"from": deployer})
+
+# Expose the first message.
+author_0  = signer_accounts[0]
+nonce_0   = 0
+content_0 = msg_contents[0]
+
+# Verify message ID computation matches the ERC-8180 formula:
+#   messageId = keccak256(author || nonce || contentHash)
+computed_id = exposer.functions.computeMessageId(author_0, nonce_0, content_hash).call()
+expected_id = Web3.keccak(
+    Web3.to_bytes(hexstr=author_0) + nonce_0.to_bytes(8, "big") + content_hash
+)
+assert computed_id == expected_id, "Message ID mismatch"
+print("✅ Message ID computation matches ERC-8180 formula")
+
+# Message should not be exposed yet.
+assert not exposer.functions.isExposed(computed_id).call(), "Message should not be exposed yet"
+
+# Expose the message.
+receipt = w3.eth.wait_for_transaction_receipt(
+    exposer.functions.exposeMessage(content_hash, author_0, nonce_0, content_0)
+        .transact({"from": deployer})
+)
+
+# Verify the MessageExposed event.
+logs = exposer.events.MessageExposed().process_receipt(receipt)
+assert logs,                                     "No MessageExposed event"
+assert logs[0].args.contentHash == content_hash, "Wrong contentHash in event"
+assert logs[0].args.messageId == computed_id,    "Wrong messageId in event"
+assert logs[0].args.author == author_0,          "Wrong author in event"
+assert logs[0].args.exposer == deployer,         "Wrong exposer in event"
+print("✅ Message exposed on-chain (MessageExposed event verified)")
+
+# Message should now be exposed.
+assert exposer.functions.isExposed(computed_id).call(), "Message should be exposed"
+
+# Double-exposure must fail.
+try:
+    exposer.functions.exposeMessage(content_hash, author_0, nonce_0, content_0) \
+        .transact({"from": deployer})
+    assert False, "Double exposure should have reverted"
+except Exception:
+    pass
+print("✅ Double exposure correctly rejected")
+
+# Expose a second message to verify independence.
+author_1  = signer_accounts[1]
+nonce_1   = 1
+content_1 = msg_contents[1]
+id_1 = exposer.functions.computeMessageId(author_1, nonce_1, content_hash).call()
+assert not exposer.functions.isExposed(id_1).call(), "Message 1 should not be exposed yet"
+exposer.functions.exposeMessage(content_hash, author_1, nonce_1, content_1) \
+    .transact({"from": deployer})
+assert exposer.functions.isExposed(id_1).call(), "Message 1 should now be exposed"
+print("✅ Second message exposed independently")
+
+# Unregistered batch must fail.
+fake_hash = Web3.keccak(b"fake batch")
+try:
+    exposer.functions.exposeMessage(fake_hash, author_0, 99, b"fake") \
+        .transact({"from": deployer})
+    assert False, "Unregistered batch should have reverted"
+except Exception:
+    pass
+print("✅ Unregistered batch correctly rejected")
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
 print()
 print(f"  Blob (hex)     : 0x{blob.hex()}")
 print(f"  Aggregate sig  : 0x{agg_sig.hex()}")
+print(f"  Content hash   : 0x{content_hash.hex()}")
+print(f"  Message ID #0  : 0x{computed_id.hex()}")
 print("✅ All tests passed")
