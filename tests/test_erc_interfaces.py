@@ -290,8 +290,7 @@ class TestExistingContractsUnmodified:
     """Verify decoder.vy and signature_registry.vy still work as before."""
 
     def test_decoder_decompress_roundtrip(self, w3, deployer):
-        from paths import CONTRACTS_DIR, CORPUS_PATH
-from bpe_encode import deploy_decoder
+        from bpe_encode import deploy_decoder
         token_to_code, dict_bytes, _, _ = build_12bit_dict_from_corpus(str(CORPUS_PATH))
         dec = deploy_decoder(w3, deployer, dict_bytes)
 

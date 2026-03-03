@@ -167,7 +167,7 @@ class DefaultBAMProvider(BAMProvider):
         from paths import CORPUS_PATH
         self._corpus_path = corpus_path or str(CORPUS_PATH)
         self._token_to_code, self._dict_bytes, self._dict_offs, self._dict_len = (
-            build_12bit_dict_from_corpus(corpus_path)
+            build_12bit_dict_from_corpus(self._corpus_path)
         )
         self._signers: Dict[str, Signer] = {}
 
